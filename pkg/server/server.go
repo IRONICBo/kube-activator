@@ -5,19 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	autoscalingv1 "k8s.io/api/autoscaling/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"log"
 	"net"
 	"time"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -29,8 +34,9 @@ const (
 )
 
 type Server struct {
-	ip        string
-	clientset kubernetes.Interface
+	ip            string
+	clientset     kubernetes.Interface
+	dynamicClient dynamic.Interface
 
 	serviceIndexer  cache.Indexer
 	endpointIndexer cache.Indexer
@@ -38,10 +44,11 @@ type Server struct {
 	manager *PortManager
 }
 
-func NewServer(ip string, clientset kubernetes.Interface) *Server {
+func NewServer(ip string, clientset kubernetes.Interface, dynamicClient dynamic.Interface) *Server {
 	return &Server{
-		ip:        ip,
-		clientset: clientset,
+		ip:            ip,
+		clientset:     clientset,
+		dynamicClient: dynamicClient,
 	}
 }
 
@@ -266,7 +273,7 @@ func (s *Server) injectEndpoint(ctx context.Context, ep *corev1.Endpoints, svc *
 		return err
 	}
 
-	// TODO: remove this
+	// TODO: remove this，这里的selector被清空和保存到label中，避免被k8s本身的行为覆盖了。
 	klog.InfoS("modify service selector")
 	selectorBytes, _ := json.Marshal(svc.Spec.Selector)
 	svc.Annotations[cacheTargetSelectorKey] = string(selectorBytes)
@@ -335,6 +342,7 @@ func (s *Server) forwardEndpoint(ctx context.Context, ep *corev1.Endpoints, port
 			klog.ErrorS(err, "forwardEndpoint failed")
 			continue
 		}
+		// 把流量转发到真实的endpoint上
 		for _, c := range ds.Connections {
 			conn, err := net.Dial("tcp", address)
 			if err != nil {
@@ -366,6 +374,7 @@ func tunnel(a, b net.Conn) {
 	go io.Copy(b, a)
 }
 
+// 这里被deployment上调用完成聚合
 func (s *Server) scaleUp(ds *PortInformation) {
 	key := cache.ObjectName{Namespace: ds.Target.Namespace, Name: ds.Target.Name}.String()
 	svcObj, exists, err := s.serviceIndexer.GetByKey(key)
@@ -378,6 +387,7 @@ func (s *Server) scaleUp(ds *PortInformation) {
 		return
 	}
 	svc := svcObj.(*corev1.Service)
+	// 这里的value就是需要是deployment的名字！！！
 	name := svc.Annotations[scaleDeploymentKey]
 	if name == "" {
 		klog.ErrorS(err, "scaleDeploymentKey not found", "ep", key)
@@ -390,21 +400,62 @@ func (s *Server) scaleUp(ds *PortInformation) {
 		return
 	}
 
-	_, err = s.clientset.AppsV1().Deployments(svc.Namespace).UpdateScale(context.Background(), name, &autoscalingv1.Scale{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: svc.Namespace,
-		},
-		Spec: autoscalingv1.ScaleSpec{
-			Replicas: 1,
-		},
-	}, metav1.UpdateOptions{})
+	// 这里完成了scaleup子资源的实现
+	namespace := ds.Target.Namespace
+	gvr := schema.GroupVersionResource{
+		Group:    "inference.llmaz.io",
+		Version:  "v1alpha1",
+		Resource: "playgrounds",
+	}
+	// scale := &autoscalingv1.Scale{
+	// 	ObjectMeta: metav1.ObjectMeta{
+	// 		Name:      name,
+	// 		Namespace: namespace,
+	// 	},
+	// 	Spec: autoscalingv1.ScaleSpec{
+	// 		Replicas: 1,
+	// 	},
+	// }
+	// updatedScale, err := s.clientset.AppsV1().Deployments(namespace).UpdateScale(context.Background(), name, scale, metav1.UpdateOptions{})
+	// if err != nil {
+	// 	log.Fatalf("Error updating scale sub-resource: %v", err)
+	// }
+	// klog.InfoS("scale up deployment", "deployment", name, "namespace", namespace, "replicas", updatedScale.Spec.Replicas)
+	playground, err := s.dynamicClient.Resource(gvr).
+		Namespace(namespace).
+		Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		log.Fatalf("Error getting Playground CRD instance: %v", err)
+	}
+	// 更新 CRD 实例
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// 修改 replicas 的值
+		if err := unstructured.SetNestedField(playground.Object, int64(1), "spec", "replicas"); err != nil {
+			return err
+		}
+
+		// 更新 CRD 实例
+		_, updateErr := s.dynamicClient.Resource(gvr).Namespace(namespace).Update(context.Background(), playground, metav1.UpdateOptions{})
+		return updateErr
+	})
+	if retryErr != nil {
+		log.Fatalf("Error updating Playground CRD instance: %v", retryErr)
+	}
+	// _, err = s.clientset.AppsV1().Deployments(svc.Namespace).UpdateScale(context.Background(), name, &autoscalingv1.Scale{
+	// 	ObjectMeta: metav1.ObjectMeta{
+	// 		Name:      name,
+	// 		Namespace: svc.Namespace,
+	// 	},
+	// 	Spec: autoscalingv1.ScaleSpec{
+	// 		Replicas: 1,
+	// 	},
+	// }, metav1.UpdateOptions{})
 	if err != nil {
 		klog.ErrorS(err, "scale up failed")
 		return
 	}
 	// Wait for the deployment to be ready
-	err = waitUntilDeploymentIsReady(s.clientset, name, svc.Namespace)
+	err = waitUntilPlaygroundIsReady(s.dynamicClient, name, svc.Namespace)
 	if err != nil {
 		klog.ErrorS(err, "wait for deployment ready failed")
 		return
@@ -421,6 +472,32 @@ func (s *Server) deploymentIsReady(dep *appsv1.Deployment) bool {
 		return false
 	}
 	return true
+}
+
+func waitUntilPlaygroundIsReady(dynamicClient dynamic.Interface, name, namespace string) error {
+	gvr := schema.GroupVersionResource{
+		Group:    "inference.llmaz.io",
+		Version:  "v1alpha1",
+		Resource: "playgrounds",
+	}
+
+	return wait.PollUntilContextTimeout(context.Background(), time.Second/10, time.Second*30, false, func(ctx context.Context) (bool, error) {
+		scale, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{}, "scale")
+		if err != nil {
+			klog.ErrorS(err, "get scale failed")
+			return false, err
+		}
+		klog.InfoS("scale", "object", scale)
+
+		replicas, found, err := unstructured.NestedInt64(scale.Object, "spec", "replicas")
+		if err != nil || !found {
+			klog.ErrorS(err, "get replicas failed")
+			return false, err
+		}
+		klog.InfoS("replicas", "replicas", replicas)
+
+		return replicas != 0, nil
+	})
 }
 
 func waitUntilDeploymentIsReady(clientset kubernetes.Interface, name, namespace string) error {

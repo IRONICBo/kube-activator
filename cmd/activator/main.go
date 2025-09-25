@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/spf13/pflag"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -68,7 +70,11 @@ func run(ctx context.Context, f *flagpole) error {
 		return fmt.Errorf("could not get Kubernetes clientset: %w", err)
 	}
 
-	s := server.NewServer(f.IP, clientset)
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		log.Fatalf("Error creating dynamic client: %v", err)
+	}
+	s := server.NewServer(f.IP, clientset, dynamicClient)
 	return s.Run(ctx)
 
 }
