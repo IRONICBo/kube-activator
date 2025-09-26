@@ -214,6 +214,7 @@ func (s *Server) restoreSelector(ctx context.Context, svc *corev1.Service) {
 	if selectorStr == "" {
 		return
 	}
+	klog.InfoS("restoreSelector", "ep", cache.MetaObjectToName(svc).String())
 
 	key := cache.ObjectName{Namespace: svc.Namespace, Name: svc.Name}.String()
 	sel := map[string]string{}
@@ -227,6 +228,7 @@ func (s *Server) restoreSelector(ctx context.Context, svc *corev1.Service) {
 		return
 	}
 
+	klog.InfoS("restore service selector", "ep", key, "selector", sel)
 	svc = svc.DeepCopy()
 
 	delete(svc.Annotations, cacheTargetSelectorKey)
@@ -455,7 +457,7 @@ func (s *Server) scaleUp(ds *PortInformation) {
 		return
 	}
 	// Wait for the deployment to be ready
-	err = waitUntilPlaygroundIsReady(s.dynamicClient, name, svc.Namespace)
+	err = waitUntilPlaygroundPodIsReady(s.clientset, name, svc.Namespace)
 	if err != nil {
 		klog.ErrorS(err, "wait for deployment ready failed")
 		return
@@ -464,7 +466,6 @@ func (s *Server) scaleUp(ds *PortInformation) {
 	// TODO: remove this
 	klog.InfoS("restore service selector")
 	s.restoreSelector(context.Background(), svc)
-
 }
 
 func (s *Server) deploymentIsReady(dep *appsv1.Deployment) bool {
@@ -474,14 +475,49 @@ func (s *Server) deploymentIsReady(dep *appsv1.Deployment) bool {
 	return true
 }
 
+func waitUntilPlaygroundPodIsReady(kubeClient kubernetes.Interface, name, namespace string) error {
+	klog.InfoS("waitUntilPlaygroundPodIsReady", "name", name, "namespace", namespace)
+
+	// 模型加载比较慢，每秒检查一次即可
+	return wait.PollUntilContextTimeout(context.Background(), time.Second, time.Minute*5, true, func(ctx context.Context) (bool, error) {
+		// 获取 Pod 的名称，假设 Pod 的名称是 playground name + '-0'
+		podName := name + "-0"
+
+		// 获取 Pod 的状态
+		pod, err := kubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			// if errors.IsNotFound(err) {
+			klog.InfoS("Pod not found, waiting for creation", "podName", podName)
+			return false, nil // Pod 不存在时继续等待
+			// }
+			// klog.ErrorS(err, "get pod failed", "podName", podName)
+			// return false, err
+		}
+
+		// 检查 Pod 的就绪状态
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				klog.InfoS("Pod is ready", "podName", podName)
+				return true, nil
+			}
+		}
+
+		klog.InfoS("Pod is not ready waiting for retry", "podName", podName)
+		return false, nil
+	})
+}
+
 func waitUntilPlaygroundIsReady(dynamicClient dynamic.Interface, name, namespace string) error {
 	gvr := schema.GroupVersionResource{
 		Group:    "inference.llmaz.io",
 		Version:  "v1alpha1",
 		Resource: "playgrounds",
 	}
+	// 注意这里检查的是replica而不是ready的replica的话等于白检查了，然后会走到旧版本的流量上！！！然后重新被截获！！！
+	// 需要查看available！！！
+	klog.InfoS("waitUntilPlaygroundIsReady", "name", name, "namespace", namespace)
 
-	return wait.PollUntilContextTimeout(context.Background(), time.Second/10, time.Second*30, false, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), time.Second/10, time.Second*30, true, func(ctx context.Context) (bool, error) {
 		scale, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{}, "scale")
 		if err != nil {
 			klog.ErrorS(err, "get scale failed")
