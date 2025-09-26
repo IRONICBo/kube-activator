@@ -26,11 +26,12 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// 更新activatorname为
 const (
-	scaleDeploymentKey = "scale-from-zero.zsm.io/deployment"
+	scaleDeploymentKey = "activator.llmaz.io/playground"
 
 	// TODO: remove this when service supports selector with external process managing its endpoints
-	cacheTargetSelectorKey = "cache.scale-from-zero.zsm.io"
+	cacheTargetSelectorKey = "cache.activator.llmaz.io"
 )
 
 type Server struct {
